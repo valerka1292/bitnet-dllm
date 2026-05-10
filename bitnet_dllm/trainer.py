@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from .model     import BitDiffLM
 from .loss      import BitDiffLMLoss
 from .dataset   import MaskedDiffusionDataset, worker_init_fn
+from .tracker   import Tracker, ConsoleTracker
 
 
 class BitDiffLMTrainer:
@@ -22,13 +23,14 @@ class BitDiffLMTrainer:
         batch_size:     int   = 32,
         learning_rate:  float = 3e-4,
         num_epochs:     int   = 10,
-        gradient_clip:  float = 1.0,
-        log_every:      int   = 100,
-        save_every:     int   = 1000,
-        save_dir:       str   = "./checkpoints",
-        device:         str   = "cuda",
-        num_workers:    int   = 4,
-        grad_accum:     int   = 1,
+        gradient_clip:  float  = 1.0,
+        log_every:      int    = 100,
+        save_every:     int    = 1000,
+        save_dir:       str    = "./checkpoints",
+        device:         str    = "cuda",
+        num_workers:    int    = 4,
+        grad_accum:     int    = 1,
+        tracker:        Tracker | None = None,
     ):
         self.model        = model.to(device)
         self.device       = device
@@ -39,6 +41,7 @@ class BitDiffLMTrainer:
         self.save_dir     = Path(save_dir)
         self.grad_accum   = grad_accum
         self.global_step  = 0
+        self.tracker      = tracker or ConsoleTracker()
 
         cfg = model.config
 
@@ -51,7 +54,7 @@ class BitDiffLMTrainer:
         self.train_loader = DataLoader(train_dataset, shuffle=True,  collate_fn=train_dataset.get_collate_fn(), **ld_kw)
         self.val_loader   = DataLoader(val_dataset,   shuffle=False, collate_fn=val_dataset.get_collate_fn(),   **ld_kw) if val_dataset else None
 
-        self.loss_fn = BitDiffLMLoss(mask_token_id=cfg.mask_token_id, t_min=cfg.t_min)
+        self.loss_fn = BitDiffLMLoss(mask_token_id=cfg.mask_token_id, t_min=cfg.t_min, time_eps=cfg.time_eps)
 
         total_steps = (len(self.train_loader) // grad_accum) * num_epochs
         optim_cfg = model.configure_optimizers(
@@ -64,19 +67,22 @@ class BitDiffLMTrainer:
         self.optimizer = optim_cfg["optimizer"]
         self.scheduler = optim_cfg["scheduler"]
 
-        self._print_info(optim_cfg["groups"], total_steps, optim_cfg["warmup_steps"])
+        self._log_info(optim_cfg["groups"], total_steps, optim_cfg["warmup_steps"])
 
-    def _print_info(self, groups, total_steps, warmup_steps):
+    def _log_info(self, groups, total_steps, warmup_steps):
         s = self.model.memory_stats()
-        print("─" * 56)
-        print(f"  total params:  {s['total']:,}  |  ternary: {s['ternary']:,}  |  float: {s['float']:,}")
-        print(f"  inference:     {s['inference_mb']:.1f} MB  |  training: {s['training_mb']:.1f} MB")
+        lines = [
+            "─" * 56,
+            f"  total params:  {s['total']:,}  |  ternary: {s['ternary']:,}  |  float: {s['float']:,}",
+            f"  inference:     {s['inference_mb']:.1f} MB  |  training: {s['training_mb']:.1f} MB",
+        ]
         if s['flash_required']:
-            print(f"  ⚠  Flash Attention required for seq_len={self.model.config.max_seq_len}")
-        print(f"  steps: {total_steps}  warmup: {warmup_steps}  grad_accum: {self.grad_accum}")
+            lines.append(f"  ⚠  Flash Attention required for seq_len={self.model.config.max_seq_len}")
+        lines.append(f"  steps: {total_steps}  warmup: {warmup_steps}  grad_accum: {self.grad_accum}")
         for k, v in groups.items():
-            print(f"  [{k}] {sum(p.numel() for p in v):,} params")
-        print("─" * 56)
+            lines.append(f"  [{k}] {sum(p.numel() for p in v):,} params")
+        lines.append("─" * 56)
+        self.tracker.log_line("\n".join(lines))
 
     def train_step(self, batch: dict) -> dict:
         self.model.train()
@@ -152,11 +158,14 @@ class BitDiffLMTrainer:
                     self.global_step += 1
 
                     if self.global_step % self.log_every == 0:
-                        print(
-                            f"[e{epoch+1} s{self.global_step}] "
-                            f"loss={lo['loss']:.4f} unwt={lo['loss_unweighted']:.4f} "
-                            f"masked={lo['n_masked']} lr={self.scheduler.get_last_lr()[0]:.2e}"
-                        )
+                        self.tracker.log({
+                            "epoch":      epoch + 1,
+                            "step":       self.global_step,
+                            "loss":       lo["loss"],
+                            "loss_unwt":  lo["loss_unweighted"],
+                            "n_masked":   lo["n_masked"],
+                            "lr":         self.scheduler.get_last_lr()[0],
+                        }, step=self.global_step)
                     if self.global_step % self.save_every == 0:
                         ckpt_dir = self.save_dir / f"step_{self.global_step}"
                         self.model.save_pretrained(ckpt_dir)
@@ -164,8 +173,10 @@ class BitDiffLMTrainer:
 
             val = self.validate()
             avg = sum(losses) / len(losses)
-            val_str = f"val_nll={val['val_nll']:.4f}  ppl={val['val_ppl']:.1f}" if val else "no val"
-            print(f"\n=== epoch {epoch+1}/{n_epochs}  loss={avg:.4f}  {val_str} ===\n")
+            if val:
+                self.tracker.log({"epoch": epoch + 1, "n_epochs": n_epochs, "loss": avg, "val_nll": val["val_nll"], "val_ppl": val["val_ppl"]})
+            else:
+                self.tracker.log({"epoch": epoch + 1, "n_epochs": n_epochs, "loss": avg})
 
         self.model.save_pretrained(self.save_dir / "final")
         self.save_checkpoint(self.save_dir / "final" / "trainer.pt")

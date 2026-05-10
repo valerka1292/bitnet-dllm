@@ -5,10 +5,11 @@ import torch.nn.functional as F
 
 
 class BitDiffLMLoss(nn.Module):
-    def __init__(self, mask_token_id: int, t_min: float = 0.05):
+    def __init__(self, mask_token_id: int, t_min: float = 0.05, time_eps: float = 1e-4):
         super().__init__()
         self.mask_token_id = mask_token_id
         self.t_min         = t_min
+        self.time_eps      = time_eps
 
     def forward(
         self,
@@ -39,7 +40,7 @@ class BitDiffLMLoss(nn.Module):
         n_masked   = is_valid.float().sum(dim=1).clamp(min=1.0)
         ce_per_seq = (ce * is_valid.float()).sum(dim=1) / n_masked
 
-        time_weights = 1.0 / (1.0 - timestep + 1e-4).to(ce_per_seq.device)
+        time_weights = 1.0 / (1.0 - timestep + self.time_eps).to(ce_per_seq.device)
         time_weights = time_weights / time_weights.mean()
 
         loss = (ce_per_seq * time_weights).mean()

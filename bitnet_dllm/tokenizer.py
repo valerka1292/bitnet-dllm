@@ -1,6 +1,22 @@
 from __future__ import annotations
 import os
 from pathlib import Path
+from pydantic import BaseModel, field_validator
+
+
+class TokenizerConfig(BaseModel):
+    vocab_size:    int
+    mask_token_id: int | None
+    pad_token_id:  int | None
+    bos_token_id:  int | None
+    eos_token_id:  int | None
+
+    @field_validator("mask_token_id")
+    @classmethod
+    def _mask_required(cls, v):
+        if v is None:
+            raise ValueError("Tokenizer must have a [MASK] token for diffusion training")
+        return v
 
 
 class BitDiffTokenizer:
@@ -89,12 +105,20 @@ class BitDiffTokenizer:
 
     @staticmethod
     def config_from_tokenizer(tokenizer, config):
-        """Sync config special token IDs from tokenizer."""
-        config.vocab_size    = len(tokenizer)
-        config.mask_token_id = tokenizer.mask_token_id
-        config.pad_token_id  = tokenizer.pad_token_id or 0
-        if tokenizer.cls_token_id is not None:
-            config.bos_token_id = tokenizer.cls_token_id
-        if tokenizer.sep_token_id is not None:
-            config.eos_token_id = tokenizer.sep_token_id
+        """Sync config special token IDs from tokenizer with schema validation."""
+        data = dict(
+            vocab_size    = len(tokenizer),
+            mask_token_id = tokenizer.mask_token_id,
+            pad_token_id  = tokenizer.pad_token_id or 0,
+            bos_token_id  = tokenizer.cls_token_id,
+            eos_token_id  = tokenizer.sep_token_id,
+        )
+        TokenizerConfig(**data)  # validate before mutating config
+        config.vocab_size    = data["vocab_size"]
+        config.mask_token_id = data["mask_token_id"]
+        config.pad_token_id  = data["pad_token_id"]
+        if data["bos_token_id"] is not None:
+            config.bos_token_id = data["bos_token_id"]
+        if data["eos_token_id"] is not None:
+            config.eos_token_id = data["eos_token_id"]
         return config
