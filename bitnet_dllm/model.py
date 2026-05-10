@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from .config    import BitDiffLMConfig
 from .blocks    import BitDiffBlock, AdaptiveRMSNorm
+from .bitlinear import BitLinear
 
 
 class TimestepEmbedding(nn.Module):
