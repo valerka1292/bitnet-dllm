@@ -3,8 +3,6 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 
 
 def _cosine_schedule(warmup: int, total: int, min_ratio: float):
@@ -16,16 +14,11 @@ def _cosine_schedule(warmup: int, total: int, min_ratio: float):
     return fn
 
 
-def get_optimizer_groups(
+def get_parameter_groups(
     model: nn.Module,
     learning_rate: float,
     weight_decay: float,
-    total_steps: int,
-    warmup_ratio: float = 0.05,
-    min_lr_ratio: float = 0.01,
-    betas: tuple = (0.9, 0.95),
-    eps: float = 1e-8,
-) -> dict:
+) -> list[dict]:
     from .bitlinear import BitLinear
 
     for m in model.modules():
@@ -35,57 +28,40 @@ def get_optimizer_groups(
             if hasattr(m, 'bias') and m.bias is not None:
                 m.bias._no_weight_decay = True
 
-    bit_ids = {id(m) for m in model.modules() if isinstance(m, BitLinear)}
+    all_params = set(model.parameters())
 
-    param_parent: dict[str, int] = {}
-    for mn, m in model.named_modules():
-        for pn, _ in m.named_parameters(recurse=False):
-            param_parent[f"{mn}.{pn}" if mn else pn] = id(m)
+    bit_params: set[torch.Tensor] = set()
+    for m in model.modules():
+        if isinstance(m, BitLinear):
+            bit_params.update(m.parameters())
 
-    groups: dict[str, list] = {"bit_d": [], "bit_nd": [], "fp_d": [], "fp_nd": []}
-    seen: set[int] = set()
-    for name, param in model.named_parameters():
-        if id(param) in seen:
-            continue
-        seen.add(id(param))
-        is_bit = param_parent.get(name) in bit_ids
-        is_nd = getattr(param, '_no_weight_decay', False)
-        key = ("bit" if is_bit else "fp") + ("_nd" if is_nd else "_d")
-        groups[key].append(param)
+    fp_params = all_params - bit_params
 
-    warmup_steps = int(total_steps * warmup_ratio)
-    optimizer = AdamW([
-        {"params": groups["bit_d"],  "lr": learning_rate * 0.7, "weight_decay": weight_decay},
-        {"params": groups["bit_nd"], "lr": learning_rate * 0.7, "weight_decay": 0.0},
-        {"params": groups["fp_d"],   "lr": learning_rate,       "weight_decay": weight_decay},
-        {"params": groups["fp_nd"],  "lr": learning_rate,       "weight_decay": 0.0},
-    ], betas=betas, eps=eps)
-    scheduler = LambdaLR(optimizer, _cosine_schedule(warmup_steps, total_steps, min_lr_ratio))
+    bit_d  = [p for p in bit_params if not getattr(p, '_no_weight_decay', False)]
+    bit_nd = [p for p in bit_params if getattr(p, '_no_weight_decay', False)]
+    fp_d   = [p for p in fp_params if not getattr(p, '_no_weight_decay', False)]
+    fp_nd  = [p for p in fp_params if getattr(p, '_no_weight_decay', False)]
 
-    return {"optimizer": optimizer, "scheduler": scheduler, "groups": groups, "total_steps": total_steps, "warmup_steps": warmup_steps}
+    return [
+        {"params": bit_d,  "lr": learning_rate * 0.7, "weight_decay": weight_decay},
+        {"params": bit_nd, "lr": learning_rate * 0.7, "weight_decay": 0.0},
+        {"params": fp_d,   "lr": learning_rate,       "weight_decay": weight_decay},
+        {"params": fp_nd,  "lr": learning_rate,       "weight_decay": 0.0},
+    ]
+
+
+
 
 
 def count_parameters(model) -> dict:
     from .bitlinear import BitLinear
-    bit, fp = 0, 0
-    seen = set()
-    for name, param in model.named_parameters():
-        if id(param) in seen:
-            continue
-        seen.add(id(param))
-        parts = name.rsplit(".", 1)
-        if len(parts) == 2:
-            try:
-                parent = model
-                for a in parts[0].split("."):
-                    parent = getattr(parent, a)
-                if isinstance(parent, BitLinear):
-                    bit += param.numel()
-                    continue
-            except AttributeError:
-                pass
-        fp += param.numel()
-
+    bit_params = set()
+    for m in model.modules():
+        if isinstance(m, BitLinear):
+            bit_params.update(m.parameters())
+    all_params = set(model.parameters())
+    bit = sum(p.numel() for p in bit_params)
+    fp = sum(p.numel() for p in (all_params - bit_params))
     total_params = bit + fp
     inference_mb = (bit * 1 + fp * 2) / 1e6
     training_mb = total_params * 16 / 1e6

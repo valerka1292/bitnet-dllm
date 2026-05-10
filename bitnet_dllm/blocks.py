@@ -49,15 +49,29 @@ class BitDiffBlock(nn.Module):
         self.attn   = BitDiffAttention(config)
         self.ffn    = SwiGLUFFN(config)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, t_emb: torch.Tensor | None = None) -> torch.Tensor:
-        if self.use_ts and t_emb is not None:
-            normed_attn, gate_attn = self.norm1(x, t_emb)
-            x = x + (1.0 + gate_attn) * self.attn(normed_attn, mask)
-            normed_ffn, gate_ffn = self.norm2(x, t_emb)
-            x = x + (1.0 + gate_ffn) * self.ffn(normed_ffn)
+    def _forward_attn(self, x, mask, t_emb):
+        normed_attn, gate_attn = self.norm1(x, t_emb) if (self.use_ts and t_emb is not None) else (*self.norm1(x), None)
+        attn_out = self.attn(normed_attn, mask)
+        if gate_attn is not None:
+            x = x + (1.0 + gate_attn) * attn_out
         else:
-            normed_attn, _ = self.norm1(x)
-            x = x + self.attn(normed_attn, mask)
-            normed_ffn, _ = self.norm2(x)
-            x = x + self.ffn(normed_ffn)
+            x = x + attn_out
+        return x
+
+    def _forward_ffn(self, x, t_emb):
+        normed_ffn, gate_ffn = self.norm2(x, t_emb) if (self.use_ts and t_emb is not None) else (*self.norm2(x), None)
+        ffn_out = self.ffn(normed_ffn)
+        if gate_ffn is not None:
+            x = x + (1.0 + gate_ffn) * ffn_out
+        else:
+            x = x + ffn_out
+        return x
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, t_emb: torch.Tensor | None = None) -> torch.Tensor:
+        if self.training and self.attn.training and getattr(self, 'gradient_checkpointing', False):
+            x = torch.utils.checkpoint.checkpoint(self._forward_attn, x, mask, t_emb, use_reentrant=False)
+            x = torch.utils.checkpoint.checkpoint(self._forward_ffn, x, t_emb, use_reentrant=False)
+        else:
+            x = self._forward_attn(x, mask, t_emb)
+            x = self._forward_ffn(x, t_emb)
         return x

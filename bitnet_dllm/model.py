@@ -38,6 +38,9 @@ class BitDiffLM(nn.Module):
         self.token_emb = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.ts_emb    = TimestepEmbedding(config.hidden_size, config.timestep_freq_dim) if config.use_timestep_cond else None
         self.blocks    = nn.ModuleList([BitDiffBlock(config) for _ in range(config.num_layers)])
+        if config.gradient_checkpointing:
+            for b in self.blocks:
+                b.gradient_checkpointing = True
         self.final_norm = nn.RMSNorm(config.hidden_size)
         self.lm_head   = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

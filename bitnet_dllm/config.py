@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 _presets: dict[str, dict] = {
@@ -21,6 +21,7 @@ def register_preset(name: str, config: dict) -> None:
 
 
 class BitDiffLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     vocab_size:          int   = 32000
     hidden_size:         int   = 768
     num_layers:          int   = 12
@@ -29,6 +30,7 @@ class BitDiffLMConfig(BaseModel):
     max_seq_len:         int   = 1024
     dropout:             float = 0.0
     activation_bits:     int   = 8
+    gradient_checkpointing: bool = False
 
     mask_token_id:       int   = 103
     pad_token_id:        int   = 0
@@ -76,8 +78,7 @@ class BitDiffLMConfig(BaseModel):
     def load(cls, path: str | Path) -> BitDiffLMConfig:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        known = set(cls.model_fields)
-        return cls(**{k: v for k, v in data.items() if k in known})
+        return cls(**data)
 
     @classmethod
     def from_preset(cls, name: str, **overrides) -> BitDiffLMConfig:

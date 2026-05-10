@@ -4,6 +4,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class STEQuantizeInput(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, Q_b: int) -> tuple[torch.Tensor, torch.Tensor]:
+        eta = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8).detach()
+        x_s = x * (Q_b / eta)
+        x_q = x_s.round().clamp(-Q_b, Q_b - 1)
+        ctx.save_for_backward(eta)
+        ctx.Q_b = Q_b
+        return x_q, eta
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor, _) -> tuple[torch.Tensor, None]:
+        eta, = ctx.saved_tensors
+        return grad_output * (ctx.Q_b / eta), None
+
+
+class STEQuantizeWeight(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor) -> torch.Tensor:
+        gamma = weight.abs().mean().clamp(min=1e-8).detach()
+        W_scaled = weight / gamma
+        W_quant = W_scaled.round().clamp(-1, 1)
+        ctx.save_for_backward(gamma)
+        return W_quant, gamma
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor, _) -> torch.Tensor:
+        return grad_output
+
+
 class BitLinear(nn.Linear):
     """
     BitNet 1.58-bit ternary Linear layer.
@@ -24,27 +54,19 @@ class BitLinear(nn.Linear):
             self.bias._no_weight_decay = True
 
     def quantize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-        Q_b  = 2 ** (self.activation_bits - 1)
-        eta  = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8).detach()
-        x_s  = x * (Q_b / eta)
-        x_q  = x_s.round().clamp(-Q_b, Q_b - 1)
-        return x_s + (x_q - x_s).detach(), eta, Q_b
+        Q_b = 2 ** (self.activation_bits - 1)
+        x_q, eta = STEQuantizeInput.apply(x, Q_b)
+        return x_q, eta, Q_b
 
-    def forward_quantized(self, x_ste: torch.Tensor, eta: torch.Tensor, Q_b: int) -> torch.Tensor:
-        gamma = self.weight.abs().mean().clamp(min=1e-8).detach()
-        W_scaled = self.weight / gamma
-        W_quant = W_scaled.round().clamp(-1, 1)
-
-        W_ste = (W_quant - self.weight).detach() + self.weight
-
-        scale = (eta * gamma / Q_b)
-
-        out = F.linear(x_ste, W_ste, self.bias) * scale
+    def forward_quantized(self, x_q: torch.Tensor, eta: torch.Tensor, Q_b: int) -> torch.Tensor:
+        W_q, gamma = STEQuantizeWeight.apply(self.weight)
+        scale = eta * gamma / Q_b
+        out = F.linear(x_q, W_q, self.bias) * scale
         return out * self.learnable_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_ste, eta, Q_b = self.quantize_input(x)
-        return self.forward_quantized(x_ste, eta, Q_b)
+        x_q, eta, Q_b = self.quantize_input(x)
+        return self.forward_quantized(x_q, eta, Q_b)
 
     def extra_repr(self) -> str:
         return f"in={self.in_features}, out={self.out_features}, bits={self.activation_bits}"

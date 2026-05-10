@@ -13,10 +13,10 @@ class RotaryEmbedding(nn.Module):
         self.max_seq_len = max_seq_len
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=True)
-        self._build_cache(max_seq_len)
 
     def _build_cache(self, seq_len: int):
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
+        device = self.inv_freq.device
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb   = torch.cat([freqs, freqs], dim=-1)
         self.register_buffer("_cos", emb.cos()[None, None], persistent=False)
@@ -29,18 +29,21 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         L = q.shape[2]
+        device = q.device
         if L <= self.max_seq_len:
-            cos = self._cos[:, :, :L].to(device=q.device, dtype=q.dtype)
-            sin = self._sin[:, :, :L].to(device=q.device, dtype=q.dtype)
+            if not hasattr(self, "_cos"):
+                self._build_cache(self.max_seq_len)
+            cos = self._cos[:, :, :L].to(device=device, dtype=q.dtype)
+            sin = self._sin[:, :, :L].to(device=device, dtype=q.dtype)
         else:
             warnings.warn(
                 f"seq_len={L} > max_seq_len={self.max_seq_len}. RoPE extrapolating.",
                 UserWarning, stacklevel=3,
             )
-            t = torch.arange(L, device=q.device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device=q.device, dtype=self.inv_freq.dtype))
-            emb   = torch.cat([freqs, freqs], dim=-1)
-            cos, sin = emb.cos()[None, None], emb.sin()[None, None]
+            if not hasattr(self, "_cos") or self._cos.shape[-1] < L:
+                self._build_cache(L)
+            cos = self._cos[:, :, :L].to(device=device, dtype=q.dtype)
+            sin = self._sin[:, :, :L].to(device=device, dtype=q.dtype)
         return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
 
 

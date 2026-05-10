@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from accelerate import Accelerator
 
 from .model     import BitDiffLM
@@ -17,6 +17,7 @@ from .utils     import count_parameters
 
 
 class TrainingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     learning_rate:   float  = 3e-4
     batch_size:      int    = 32
     num_epochs:      int    = 10
@@ -32,6 +33,7 @@ class TrainingConfig(BaseModel):
     min_lr_ratio:    float  = 0.01
     betas:           tuple  = (0.9, 0.95)
     eps:             float  = 1e-8
+    gradient_checkpointing: bool = False
 
 
 class BitDiffLMTrainer:
@@ -58,6 +60,12 @@ class BitDiffLMTrainer:
         self.model, self.optimizer, self.train_loader, self.scheduler = \
             self.accelerator.prepare(model, optimizer, train_loader, scheduler)
         self.val_loader = self.accelerator.prepare(val_loader) if val_loader else None
+
+        if config.gradient_checkpointing:
+            raw = self.accelerator.unwrap_model(self.model)
+            raw.config.gradient_checkpointing = True
+            for b in raw.blocks:
+                b.gradient_checkpointing = True
 
         self.ema_model = deepcopy(self.accelerator.unwrap_model(self.model)).eval()
         for p in self.ema_model.parameters():
@@ -116,9 +124,11 @@ class BitDiffLMTrainer:
         self.accelerator.load_state(path)
 
     def save_pretrained(self, save_dir: str | Path):
+        save_dir = Path(save_dir)
         raw = self.accelerator.unwrap_model(self.model)
         raw.save_pretrained(save_dir)
-        self.save_checkpoint(Path(save_dir) / "trainer.pt")
+        self.ema_model.save_pretrained(save_dir / "ema")
+        self.save_checkpoint(save_dir / "trainer.pt")
 
     def train(self, num_epochs: int | None = None):
         n_epochs = num_epochs or self.config.num_epochs

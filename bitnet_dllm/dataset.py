@@ -39,8 +39,14 @@ class MaskedDiffusionDataset(Dataset):
         return len(self.hf_dataset)
 
     def __getitem__(self, idx: int) -> dict:
-        ids = self.hf_dataset[idx][self._input_ids_key]
-        return {"input_ids": torch.tensor(ids, dtype=torch.long) if not isinstance(ids, torch.Tensor) else ids.clone()}
+        item = self.hf_dataset[idx]
+        if isinstance(item, dict):
+            ids = item[self._input_ids_key]
+        elif isinstance(item, torch.Tensor):
+            ids = item
+        else:
+            ids = item
+        return {"input_ids": ids}
 
     def get_collate_fn(self):
         pad_id = self.pad_token_id
@@ -51,17 +57,18 @@ class MaskedDiffusionDataset(Dataset):
 
         def _collate(batch: list[dict]) -> dict:
             B = len(batch)
-            lengths = [b["input_ids"].shape[0] for b in batch]
+            ids_list = [torch.as_tensor(b["input_ids"], dtype=torch.long) for b in batch]
+            lengths = [ids.shape[0] for ids in ids_list]
             max_len = max(lengths)
 
             padded = torch.full((B, max_len), pad_id, dtype=torch.long)
             labels = torch.full((B, max_len), -100, dtype=torch.long)
             attn_mask = torch.zeros((B, max_len), dtype=torch.long)
 
-            for i, b in enumerate(batch):
+            for i, ids in enumerate(ids_list):
                 n = lengths[i]
-                padded[i, :n] = b["input_ids"]
-                labels[i, :n] = b["input_ids"]
+                padded[i, :n] = ids
+                labels[i, :n] = ids
                 attn_mask[i, :n] = 1
 
             t = torch.empty(B, dtype=torch.float32).uniform_(t_min, t_max)
