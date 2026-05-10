@@ -84,27 +84,3 @@ class BitDiffLMConfig(BaseModel):
         if name not in _presets:
             raise ValueError(f"Unknown preset '{name}'. Available: {list(_presets)}")
         return cls(**{**_presets[name], **overrides})
-
-    def memory_stats(self) -> dict:
-        H, F, N, V, L = (
-            self.hidden_size, self.ffn_hidden_size,
-            self.num_layers, self.vocab_size, self.max_seq_len,
-        )
-        bit_params  = N * (4 * H * H + 2 * H * F + F * H)
-        emb_params  = V * H
-        lm_h_params = 0 if self.tie_word_embeddings else V * H
-        rms_params  = (N * 4 + 1) * H
-        ada_params  = N * 2 * (H * 2 * H + 2 * H + 1) if self.use_timestep_cond else 0
-        freq        = self.timestep_freq_dim
-        ts_params   = (freq * 2 * H + 2 * H) + (2 * H * H + H) + H if self.use_timestep_cond else 0
-        float_params = emb_params + lm_h_params + rms_params + ada_params + ts_params
-        total        = bit_params + float_params
-        return {
-            "total":            total,
-            "ternary":          bit_params,
-            "float":            float_params,
-            "inference_mb":     (bit_params * 1 + float_params * 2) / 1e6,
-            "training_mb":      total * 16 / 1e6,
-            "attn_act_mb":      N * self.num_heads * L * L * 4 / 1e6,
-            "flash_required":   L > 512,
-        }

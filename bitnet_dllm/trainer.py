@@ -7,92 +7,89 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from pydantic import BaseModel, Field
+from accelerate import Accelerator
 
 from .model     import BitDiffLM
 from .loss      import BitDiffLMLoss
-from .dataset   import MaskedDiffusionDataset, worker_init_fn
 from .tracker   import Tracker, ConsoleTracker
+from .utils     import count_parameters
+
+
+class TrainingConfig(BaseModel):
+    learning_rate:   float  = 3e-4
+    batch_size:      int    = 32
+    num_epochs:      int    = 10
+    gradient_clip:   float  = 1.0
+    log_every:       int    = 100
+    save_every:      int    = 1000
+    save_dir:        str    = "./checkpoints"
+    num_workers:     int    = 4
+    grad_accum:      int    = Field(1, ge=1)
+    ema_decay:       float  = 0.9999
+    weight_decay:    float  = 0.01
+    warmup_ratio:    float  = 0.05
+    min_lr_ratio:    float  = 0.01
+    betas:           tuple  = (0.9, 0.95)
+    eps:             float  = 1e-8
 
 
 class BitDiffLMTrainer:
     def __init__(
         self,
-        model:          BitDiffLM,
-        train_dataset:  MaskedDiffusionDataset,
-        val_dataset:    MaskedDiffusionDataset | None = None,
-        batch_size:     int   = 32,
-        learning_rate:  float = 3e-4,
-        num_epochs:     int   = 10,
-        gradient_clip:  float  = 1.0,
-        log_every:      int    = 100,
-        save_every:     int    = 1000,
-        save_dir:       str    = "./checkpoints",
-        device:         str    = "cuda",
-        num_workers:    int    = 4,
-        grad_accum:     int    = 1,
-        tracker:        Tracker | None = None,
+        model:         BitDiffLM,
+        optimizer:     torch.optim.Optimizer,
+        scheduler:     torch.optim.lr_scheduler.LambdaLR,
+        train_loader:  DataLoader,
+        config:        TrainingConfig,
+        val_loader:    DataLoader | None = None,
+        tracker:       Tracker | None = None,
     ):
-        self.model        = model.to(device)
-        self.device       = device
-        self.num_epochs   = num_epochs
-        self.grad_clip    = gradient_clip
-        self.log_every    = log_every
-        self.save_every   = save_every
-        self.save_dir     = Path(save_dir)
-        self.grad_accum   = grad_accum
-        self.global_step  = 0
-        self.tracker      = tracker or ConsoleTracker()
-
-        cfg = model.config
-
-        ld_kw = dict(
-            batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=(device == "cuda"),
-            worker_init_fn=worker_init_fn,
+        self.config     = config
+        self.tracker    = tracker or ConsoleTracker()
+        self.global_step = 0
+        self.loss_fn    = BitDiffLMLoss(
+            mask_token_id=model.config.mask_token_id,
+            t_min=model.config.t_min,
+            time_eps=model.config.time_eps,
         )
-        self.train_loader = DataLoader(train_dataset, shuffle=True,  collate_fn=train_dataset.get_collate_fn(), **ld_kw)
-        self.val_loader   = DataLoader(val_dataset,   shuffle=False, collate_fn=val_dataset.get_collate_fn(),   **ld_kw) if val_dataset else None
 
-        self.loss_fn = BitDiffLMLoss(mask_token_id=cfg.mask_token_id, t_min=cfg.t_min, time_eps=cfg.time_eps)
+        self.accelerator = Accelerator(gradient_accumulation_steps=config.grad_accum)
+        self.model, self.optimizer, self.train_loader, self.scheduler = \
+            self.accelerator.prepare(model, optimizer, train_loader, scheduler)
+        self.val_loader = self.accelerator.prepare(val_loader) if val_loader else None
 
-        total_steps = (len(self.train_loader) // grad_accum) * num_epochs
-        optim_cfg = model.configure_optimizers(
-            learning_rate=learning_rate,
-            weight_decay=cfg.weight_decay,
-            total_steps=total_steps,
-            warmup_ratio=cfg.warmup_ratio,
-            min_lr_ratio=cfg.min_lr_ratio,
-        )
-        self.optimizer = optim_cfg["optimizer"]
-        self.scheduler = optim_cfg["scheduler"]
+        self.ema_model = deepcopy(self.accelerator.unwrap_model(self.model)).eval()
+        for p in self.ema_model.parameters():
+            p.requires_grad_(False)
 
-        self._log_info(optim_cfg["groups"], total_steps, optim_cfg["warmup_steps"])
+        self._log_info()
 
-    def _log_info(self, groups, total_steps, warmup_steps):
-        s = self.model.memory_stats()
+    def _log_info(self):
+        raw = self.accelerator.unwrap_model(self.model)
+        s   = count_parameters(raw)
         lines = [
             "─" * 56,
             f"  total params:  {s['total']:,}  |  ternary: {s['ternary']:,}  |  float: {s['float']:,}",
             f"  inference:     {s['inference_mb']:.1f} MB  |  training: {s['training_mb']:.1f} MB",
         ]
-        if s['flash_required']:
-            lines.append(f"  ⚠  Flash Attention required for seq_len={self.model.config.max_seq_len}")
-        lines.append(f"  steps: {total_steps}  warmup: {warmup_steps}  grad_accum: {self.grad_accum}")
-        for k, v in groups.items():
-            lines.append(f"  [{k}] {sum(p.numel() for p in v):,} params")
+        if raw.config.max_seq_len > 512:
+            lines.append(f"  ⚠  Flash Attention required for seq_len={raw.config.max_seq_len}")
+        lines.append(f"  epochs: {self.config.num_epochs}  grad_accum: {self.config.grad_accum}")
         lines.append("─" * 56)
         self.tracker.log_line("\n".join(lines))
 
+    def _update_ema(self):
+        raw_model = self.accelerator.unwrap_model(self.model)
+        decay = self.config.ema_decay
+        with torch.no_grad():
+            for ema_p, model_p in zip(self.ema_model.parameters(), raw_model.parameters()):
+                ema_p.data.mul_(decay).add_(model_p.data, alpha=1.0 - decay)
+
     def train_step(self, batch: dict) -> dict:
         self.model.train()
-        ids  = batch["input_ids"].to(self.device)
-        lbl  = batch["labels"].to(self.device)
-        attn = batch["attention_mask"].to(self.device)
-        t    = batch["timestep"].to(self.device)
-        out  = self.model(ids, attn, t)
-        lo   = self.loss_fn(out["logits"], lbl, ids, t, attn)
-        (lo["loss"] / self.grad_accum).backward()
+        out = self.model(batch["input_ids"], batch["attention_mask"], batch["timestep"])
+        lo  = self.loss_fn(out["logits"], batch["labels"], batch["input_ids"], batch["timestep"], batch["attention_mask"])
         return lo
 
     @torch.no_grad()
@@ -102,12 +99,8 @@ class BitDiffLMTrainer:
         self.model.eval()
         total_nll, total_n = 0.0, 0
         for batch in self.val_loader:
-            ids  = batch["input_ids"].to(self.device)
-            lbl  = batch["labels"].to(self.device)
-            attn = batch["attention_mask"].to(self.device)
-            t    = batch["timestep"].to(self.device)
-            out  = self.model(ids, attn, t)
-            lo   = self.loss_fn(out["logits"], lbl, ids, t, attn)
+            out = self.model(batch["input_ids"], batch["attention_mask"], batch["timestep"])
+            lo  = self.loss_fn(out["logits"], batch["labels"], batch["input_ids"], batch["timestep"], batch["attention_mask"])
             n = lo["n_masked"]
             total_nll += lo["loss_unweighted"] * n
             total_n   += n
@@ -116,67 +109,67 @@ class BitDiffLMTrainer:
 
     def save_checkpoint(self, path: str | Path):
         tmp_path = str(path) + ".tmp"
-        torch.save({
-            "global_step": self.global_step,
-            "optimizer":   self.optimizer.state_dict(),
-            "scheduler":   self.scheduler.state_dict(),
-        }, tmp_path)
+        self.accelerator.save_state(tmp_path)
         os.replace(tmp_path, path)
 
     def load_checkpoint(self, path: str | Path):
-        ckpt = torch.load(path, map_location="cpu")
-        self.global_step = ckpt["global_step"]
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.scheduler.load_state_dict(ckpt["scheduler"])
+        self.accelerator.load_state(path)
 
     def save_pretrained(self, save_dir: str | Path):
-        self.model.save_pretrained(save_dir)
+        raw = self.accelerator.unwrap_model(self.model)
+        raw.save_pretrained(save_dir)
         self.save_checkpoint(Path(save_dir) / "trainer.pt")
 
     def train(self, num_epochs: int | None = None):
-        n_epochs = num_epochs or self.num_epochs
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.optimizer.zero_grad()
-
-        ema_model = deepcopy(self.model).eval()
-        ema_decay = 0.9999
+        n_epochs = num_epochs or self.config.num_epochs
+        save_dir = Path(self.config.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
         for epoch in range(n_epochs):
             losses = []
-            for batch_idx, batch in enumerate(self.train_loader):
-                lo = self.train_step(batch)
-                losses.append(lo["loss"].item() if torch.is_tensor(lo["loss"]) else lo["loss"])
+            for batch in self.train_loader:
+                with self.accelerator.accumulate(self.model):
+                    lo = self.train_step(batch)
+                    self.accelerator.backward(lo["loss"])
 
-                if (batch_idx + 1) % self.grad_accum == 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+
                     self.optimizer.step()
                     self.scheduler.step()
-                    with torch.no_grad():
-                        for param_q, param_ema in zip(self.model.parameters(), ema_model.parameters()):
-                            param_ema.data.mul_(ema_decay).add_(param_q.data, alpha=1.0 - ema_decay)
                     self.optimizer.zero_grad()
-                    self.global_step += 1
 
-                    if self.global_step % self.log_every == 0:
-                        self.tracker.log({
-                            "epoch":      epoch + 1,
-                            "step":       self.global_step,
-                            "loss":       lo["loss"],
-                            "loss_unwt":  lo["loss_unweighted"],
-                            "n_masked":   lo["n_masked"],
-                            "lr":         self.scheduler.get_last_lr()[0],
-                        }, step=self.global_step)
-                    if self.global_step % self.save_every == 0:
-                        ckpt_dir = self.save_dir / f"step_{self.global_step}"
-                        self.model.save_pretrained(ckpt_dir)
-                        self.save_checkpoint(ckpt_dir / "trainer.pt")
+                    if self.accelerator.sync_gradients:
+                        self._update_ema()
+                        self.global_step += 1
+
+                if self.global_step % self.config.log_every == 0 and self.accelerator.sync_gradients:
+                    self.tracker.log({
+                        "epoch":     epoch + 1,
+                        "step":      self.global_step,
+                        "loss":      lo["loss"],
+                        "loss_unwt": lo["loss_unweighted"],
+                        "n_masked":  lo["n_masked"],
+                        "lr":        self.scheduler.get_last_lr()[0],
+                    }, step=self.global_step)
+
+                if self.global_step % self.config.save_every == 0 and self.accelerator.sync_gradients:
+                    ckpt_dir = save_dir / f"step_{self.global_step}"
+                    raw = self.accelerator.unwrap_model(self.model)
+                    raw.save_pretrained(ckpt_dir)
+                    self.save_checkpoint(ckpt_dir / "trainer.pt")
+
+                if not self.accelerator.sync_gradients:
+                    losses.append(lo["loss"].item() if torch.is_tensor(lo["loss"]) else lo["loss"])
 
             val = self.validate()
-            avg = sum(losses) / len(losses)
+            local_losses = [l for l in losses] if losses else [0.0]
+            avg = sum(local_losses) / len(local_losses)
             if val:
                 self.tracker.log({"epoch": epoch + 1, "n_epochs": n_epochs, "loss": avg, "val_nll": val["val_nll"], "val_ppl": val["val_ppl"]})
             else:
                 self.tracker.log({"epoch": epoch + 1, "n_epochs": n_epochs, "loss": avg})
 
-        self.model.save_pretrained(self.save_dir / "final")
-        self.save_checkpoint(self.save_dir / "final" / "trainer.pt")
+        raw = self.accelerator.unwrap_model(self.model)
+        raw.save_pretrained(save_dir / "final")
+        self.save_checkpoint(save_dir / "final" / "trainer.pt")
