@@ -65,13 +65,25 @@ class BitDiffAttention(nn.Module):
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
         H, Dh   = self.num_heads, self.head_dim
+
         q = self.q_proj(x).view(B, L, H, Dh).transpose(1, 2)
         k = self.k_proj(x).view(B, L, H, Dh).transpose(1, 2)
         v = self.v_proj(x).view(B, L, H, Dh).transpose(1, 2)
+
         q, k  = self.rotary(q, k)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
         if attention_mask is not None:
-            scores = scores - (1.0 - attention_mask.float())[:, None, None, :] * 1e9
-        attn = self.dropout(F.softmax(scores, dim=-1))
-        out  = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, L, D)
+            bool_mask = attention_mask.bool().unsqueeze(1).unsqueeze(2)
+        else:
+            bool_mask = None
+
+        p_drop = self.dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=bool_mask,
+            dropout_p=p_drop,
+            is_causal=False
+        )
+
+        out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.out_proj(out)

@@ -52,9 +52,9 @@ class BitDiffBlock(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor, t_emb: torch.Tensor | None = None) -> torch.Tensor:
         if self.use_ts and t_emb is not None:
             normed_attn, gate_attn = self.norm1(x, t_emb)
-            x = x + gate_attn * self.attn(normed_attn, mask)
+            x = x + (1.0 + gate_attn) * self.attn(normed_attn, mask)
             normed_ffn, gate_ffn = self.norm2(x, t_emb)
-            x = x + gate_ffn * self.ffn(normed_ffn)
+            x = x + (1.0 + gate_ffn) * self.ffn(normed_ffn)
         else:
             normed_attn, _ = self.norm1(x)
             x = x + self.attn(normed_attn, mask)

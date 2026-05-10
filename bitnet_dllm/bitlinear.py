@@ -30,9 +30,14 @@ class BitLinear(nn.Linear):
 
     def forward_quantized(self, x_ste: torch.Tensor, eta: torch.Tensor, Q_b: int) -> torch.Tensor:
         gamma = self.weight.abs().mean().clamp(min=1e-8).detach()
-        W = self.weight / gamma
-        W_ste = W + (W.round().clamp(-1, 1) - W).detach()
-        out = F.linear(x_ste, W_ste, self.bias) * (eta * gamma / Q_b)
+        W_scaled = self.weight / gamma
+        W_quant = W_scaled.round().clamp(-1, 1)
+
+        W_ste = (W_quant - self.weight).detach() + self.weight
+
+        scale = (eta * gamma / Q_b)
+
+        out = F.linear(x_ste, W_ste, self.bias) * scale
         return out * self.learnable_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

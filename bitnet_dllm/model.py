@@ -97,8 +97,16 @@ class BitDiffLM(nn.Module):
 
         no_decay: set[str] = set()
         for name, param in self.named_parameters():
-            if name.endswith(".bias") or param_to_parent.get(name) in norm_ids:
+            parent_id = param_to_parent.get(name)
+            if name.endswith(".bias") or parent_id in norm_ids:
                 no_decay.add(name)
+
+        for name, mod in self.named_modules():
+            if isinstance(mod, BitLinear):
+                no_decay.add(f"{name}.weight")
+                if mod.bias is not None:
+                    no_decay.add(f"{name}.bias")
+
         return no_decay
 
     def save_pretrained(self, save_dir: str | Path):

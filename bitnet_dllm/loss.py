@@ -38,7 +38,11 @@ class BitDiffLMLoss(nn.Module):
 
         n_masked   = is_valid.float().sum(dim=1).clamp(min=1.0)
         ce_per_seq = (ce * is_valid.float()).sum(dim=1) / n_masked
-        loss       = ce_per_seq.mean()
+
+        time_weights = 1.0 / (1.0 - timestep + 1e-4).to(ce_per_seq.device)
+        time_weights = time_weights / time_weights.mean()
+
+        loss = (ce_per_seq * time_weights).mean()
 
         return {
             "loss":            loss,
