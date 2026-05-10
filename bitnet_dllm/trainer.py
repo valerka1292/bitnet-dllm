@@ -111,8 +111,11 @@ class BitDiffLMTrainer:
             out = self.model(batch["input_ids"], batch["attention_mask"], batch["timestep"])
             lo  = self.loss_fn(out["logits"], batch["labels"], batch["input_ids"], batch["timestep"], batch["attention_mask"])
             n = lo["n_masked"]
-            total_nll += lo["loss_unweighted"] * n
-            total_n   += n
+            loss_unwt = lo["loss_unweighted"] * n
+            n_tensor = torch.tensor(n, device=self.accelerator.device, dtype=torch.float)
+            gathered_loss, gathered_n = self.accelerator.gather_for_metrics((torch.tensor(loss_unwt, device=self.accelerator.device), n_tensor))
+            total_nll += gathered_loss.sum().item()
+            total_n   += gathered_n.sum().item()
         avg = total_nll / max(total_n, 1)
         return {"val_nll": avg, "val_ppl": math.exp(min(avg, 20))}
 

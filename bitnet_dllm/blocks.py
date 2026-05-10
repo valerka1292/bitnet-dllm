@@ -49,14 +49,14 @@ class BitDiffBlock(nn.Module):
         self.attn   = BitDiffAttention(config)
         self.ffn    = SwiGLUFFN(config)
 
-    def _forward_attn(self, x, mask, t_emb):
+    def _forward_attn(self, x, mask, t_emb, past_key_values=None):
         normed_attn, gate_attn = self.norm1(x, t_emb) if (self.use_ts and t_emb is not None) else (*self.norm1(x), None)
-        attn_out = self.attn(normed_attn, mask)
+        attn_out, cache = self.attn(normed_attn, mask, past_key_values)
         if gate_attn is not None:
             x = x + (1.0 + gate_attn) * attn_out
         else:
             x = x + attn_out
-        return x
+        return x, cache
 
     def _forward_ffn(self, x, t_emb):
         normed_ffn, gate_ffn = self.norm2(x, t_emb) if (self.use_ts and t_emb is not None) else (*self.norm2(x), None)
@@ -67,11 +67,17 @@ class BitDiffBlock(nn.Module):
             x = x + ffn_out
         return x
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, t_emb: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x:                torch.Tensor,
+        mask:             torch.Tensor,
+        t_emb:            torch.Tensor | None = None,
+        past_key_values:  tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if self.training and self.attn.training and getattr(self, 'gradient_checkpointing', False):
-            x = torch.utils.checkpoint.checkpoint(self._forward_attn, x, mask, t_emb, use_reentrant=False)
+            x = torch.utils.checkpoint.checkpoint(self._forward_attn, x, mask, t_emb, use_reentrant=False)[0]
             x = torch.utils.checkpoint.checkpoint(self._forward_ffn, x, t_emb, use_reentrant=False)
-        else:
-            x = self._forward_attn(x, mask, t_emb)
-            x = self._forward_ffn(x, t_emb)
-        return x
+            return x, None
+        x, cache = self._forward_attn(x, mask, t_emb, past_key_values=past_key_values)
+        x = self._forward_ffn(x, t_emb)
+        return x, cache

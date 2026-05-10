@@ -49,6 +49,10 @@ class BitDiffLM(nn.Module):
 
         self._init_weights()
 
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
     def _init_weights(self):
         ada_proj_ids   = {id(m.proj) for m in self.modules() if isinstance(m, AdaptiveRMSNorm)}
         tied_w_ids     = {id(self.lm_head.weight)} if self.config.tie_word_embeddings else set()
@@ -78,17 +82,21 @@ class BitDiffLM(nn.Module):
 
     def forward(
         self,
-        input_ids:      torch.Tensor,
-        attention_mask: torch.Tensor,
-        timestep:       torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
+        input_ids:          torch.Tensor,
+        attention_mask:     torch.Tensor,
+        timestep:           torch.Tensor | None = None,
+        past_key_values:    list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> dict[str, torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]]:
         x     = self.token_emb(input_ids)
         t_emb = self.ts_emb(timestep) if (self.ts_emb is not None and timestep is not None) else None
-        for block in self.blocks:
-            x = block(x, attention_mask, t_emb)
+        new_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for i, block in enumerate(self.blocks):
+            pkv = past_key_values[i] if past_key_values is not None and i < len(past_key_values) else None
+            x, cache = block(x, attention_mask, t_emb, past_key_values=pkv)
+            new_caches.append(cache)
         x      = self.final_norm(x)
         logits = self.lm_head(x)
-        return {"logits": logits, "hidden_states": x}
+        return {"logits": logits, "hidden_states": x, "past_key_values": new_caches}
 
     def no_weight_decay_parameters(self) -> set[str]:
         return {n for n, p in self.named_parameters() if getattr(p, '_no_weight_decay', False)}

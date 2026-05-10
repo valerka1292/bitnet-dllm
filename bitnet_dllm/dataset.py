@@ -77,7 +77,8 @@ class MaskedDiffusionDataset(Dataset):
 
             t = torch.empty(B, dtype=torch.float32).uniform_(t_min, t_max)
             mask_prob = 1.0 - alpha_fn(t)
-            mask = torch.rand(B, max_len) < mask_prob[:, None]
+            is_not_pad = (padded != pad_id)
+            mask = (torch.rand(B, max_len) < mask_prob[:, None]) & is_not_pad
             noisy = padded.clone()
             noisy[mask] = mask_id
 
