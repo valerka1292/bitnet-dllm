@@ -5,10 +5,21 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 
 from .config    import BitDiffLMConfig
 from .bitlinear import BitLinear
 from .blocks    import BitDiffBlock, AdaptiveRMSNorm
+
+
+def _cosine_schedule(warmup: int, total: int, min_ratio: float):
+    def fn(step: int) -> float:
+        if step < warmup:
+            return step / max(1, warmup)
+        p = (step - warmup) / max(1, total - warmup)
+        return max(min_ratio, 0.5 * (1.0 + math.cos(math.pi * p)))
+    return fn
 
 
 class TimestepEmbedding(nn.Module):
@@ -69,8 +80,10 @@ class BitDiffLM(nn.Module):
             elif isinstance(module, (nn.RMSNorm, nn.LayerNorm)):
                 if module.weight is not None:
                     nn.init.ones_(module.weight)
+                    module.weight._no_weight_decay = True
                 if hasattr(module, "bias") and module.bias is not None:
                     nn.init.zeros_(module.bias)
+                    module.bias._no_weight_decay = True
 
     def forward(
         self,
@@ -87,27 +100,44 @@ class BitDiffLM(nn.Module):
         return {"logits": logits, "hidden_states": x}
 
     def no_weight_decay_parameters(self) -> set[str]:
-        norm_ids  = {id(m) for m in self.modules() if isinstance(m, (nn.RMSNorm, nn.LayerNorm))}
+        return {n for n, p in self.named_parameters() if getattr(p, '_no_weight_decay', False)}
 
-        param_to_parent: dict[str, int] = {}
-        for mod_name, mod in self.named_modules():
-            for p_name, param in mod.named_parameters(recurse=False):
-                full = f"{mod_name}.{p_name}" if mod_name else p_name
-                param_to_parent[full] = id(mod)
+    def configure_optimizers(self, learning_rate: float, weight_decay: float, total_steps: int, warmup_ratio: float = 0.05, min_lr_ratio: float = 0.01, betas: tuple = (0.9, 0.95), eps: float = 1e-8) -> dict:
+        for m in self.modules():
+            if isinstance(m, (nn.RMSNorm, nn.LayerNorm)):
+                if hasattr(m, 'weight') and m.weight is not None:
+                    m.weight._no_weight_decay = True
+                if hasattr(m, 'bias') and m.bias is not None:
+                    m.bias._no_weight_decay = True
 
-        no_decay: set[str] = set()
+        bit_ids = {id(m) for m in self.modules() if isinstance(m, BitLinear)}
+
+        param_parent: dict[str, int] = {}
+        for mn, m in self.named_modules():
+            for pn, _ in m.named_parameters(recurse=False):
+                param_parent[f"{mn}.{pn}" if mn else pn] = id(m)
+
+        groups: dict[str, list] = {"bit_d": [], "bit_nd": [], "fp_d": [], "fp_nd": []}
+        seen: set[int] = set()
         for name, param in self.named_parameters():
-            parent_id = param_to_parent.get(name)
-            if name.endswith(".bias") or parent_id in norm_ids:
-                no_decay.add(name)
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            is_bit = param_parent.get(name) in bit_ids
+            is_nd  = getattr(param, '_no_weight_decay', False)
+            key    = ("bit" if is_bit else "fp") + ("_nd" if is_nd else "_d")
+            groups[key].append(param)
 
-        for name, mod in self.named_modules():
-            if isinstance(mod, BitLinear):
-                no_decay.add(f"{name}.weight")
-                if mod.bias is not None:
-                    no_decay.add(f"{name}.bias")
+        warmup_steps = int(total_steps * warmup_ratio)
+        optimizer = AdamW([
+            {"params": groups["bit_d"],  "lr": learning_rate * 0.7, "weight_decay": weight_decay},
+            {"params": groups["bit_nd"], "lr": learning_rate * 0.7, "weight_decay": 0.0},
+            {"params": groups["fp_d"],   "lr": learning_rate,       "weight_decay": weight_decay},
+            {"params": groups["fp_nd"],  "lr": learning_rate,       "weight_decay": 0.0},
+        ], betas=betas, eps=eps)
+        scheduler = LambdaLR(optimizer, _cosine_schedule(warmup_steps, total_steps, min_lr_ratio))
 
-        return no_decay
+        return {"optimizer": optimizer, "scheduler": scheduler, "groups": groups, "total_steps": total_steps, "warmup_steps": warmup_steps}
 
     def save_pretrained(self, save_dir: str | Path):
         d = Path(save_dir)

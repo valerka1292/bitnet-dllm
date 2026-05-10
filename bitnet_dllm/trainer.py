@@ -7,22 +7,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 
 from .model     import BitDiffLM
-from .bitlinear import BitLinear
 from .loss      import BitDiffLMLoss
 from .dataset   import MaskedDiffusionDataset, worker_init_fn
-
-
-def _cosine_schedule(warmup: int, total: int, min_ratio: float):
-    def fn(step: int) -> float:
-        if step < warmup:
-            return step / max(1, warmup)
-        p = (step - warmup) / max(1, total - warmup)
-        return max(min_ratio, 0.5 * (1.0 + math.cos(math.pi * p)))
-    return fn
 
 
 class BitDiffLMTrainer:
@@ -65,41 +53,18 @@ class BitDiffLMTrainer:
 
         self.loss_fn = BitDiffLMLoss(mask_token_id=cfg.mask_token_id, t_min=cfg.t_min)
 
-        no_decay_names = model.no_weight_decay_parameters()
+        total_steps = (len(self.train_loader) // grad_accum) * num_epochs
+        optim_cfg = model.configure_optimizers(
+            learning_rate=learning_rate,
+            weight_decay=cfg.weight_decay,
+            total_steps=total_steps,
+            warmup_ratio=cfg.warmup_ratio,
+            min_lr_ratio=cfg.min_lr_ratio,
+        )
+        self.optimizer = optim_cfg["optimizer"]
+        self.scheduler = optim_cfg["scheduler"]
 
-        bit_mod_ids = {id(m) for m in model.modules() if isinstance(m, BitLinear)}
-
-        param_parent: dict[str, int] = {}
-        for mn, m in model.named_modules():
-            for pn, _ in m.named_parameters(recurse=False):
-                param_parent[f"{mn}.{pn}" if mn else pn] = id(m)
-
-        groups: dict[str, list] = {"bit_d": [], "bit_nd": [], "fp_d": [], "fp_nd": []}
-        seen: set[int] = set()
-
-        for name, param in model.named_parameters():
-            if id(param) in seen:
-                continue
-            seen.add(id(param))
-            is_bit = param_parent.get(name) in bit_mod_ids
-            is_nd  = name in no_decay_names
-            key    = ("bit" if is_bit else "fp") + ("_nd" if is_nd else "_d")
-            groups[key].append(param)
-
-        lr = learning_rate
-        wd = cfg.weight_decay
-        self.optimizer = AdamW([
-            {"params": groups["bit_d"],  "lr": lr * 0.7, "weight_decay": wd},
-            {"params": groups["bit_nd"], "lr": lr * 0.7, "weight_decay": 0.0},
-            {"params": groups["fp_d"],   "lr": lr,       "weight_decay": wd},
-            {"params": groups["fp_nd"],  "lr": lr,       "weight_decay": 0.0},
-        ], betas=(0.9, 0.95), eps=1e-8)
-
-        total_steps  = (len(self.train_loader) // grad_accum) * num_epochs
-        warmup_steps = int(total_steps * cfg.warmup_ratio)
-        self.scheduler = LambdaLR(self.optimizer, _cosine_schedule(warmup_steps, total_steps, cfg.min_lr_ratio))
-
-        self._print_info(groups, total_steps, warmup_steps)
+        self._print_info(optim_cfg["groups"], total_steps, optim_cfg["warmup_steps"])
 
     def _print_info(self, groups, total_steps, warmup_steps):
         s = self.model.memory_stats()

@@ -20,6 +20,8 @@ class BitLinear(nn.Linear):
         super().__init__(in_features, out_features, bias=bias)
         self.activation_bits  = activation_bits
         self.learnable_scale  = nn.Parameter(torch.ones(1))
+        if self.bias is not None:
+            self.bias._no_weight_decay = True
 
     def quantize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
         Q_b  = 2 ** (self.activation_bits - 1)
