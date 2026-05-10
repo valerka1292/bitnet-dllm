@@ -1,6 +1,5 @@
 from __future__ import annotations
 import torch
-import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
@@ -89,17 +88,21 @@ class MaskedDiffusionDataset(Dataset):
         pad_id = self.pad_token_id
         def _collate(batch: list[dict]) -> dict:
             max_len = max(b["input_ids"].shape[0] for b in batch)
-            ids_out, lbl_out, mask_out = [], [], []
-            for b in batch:
+            B = len(batch)
+            ids_buf = torch.full((B, max_len), pad_id, dtype=torch.long)
+            lbl_buf = torch.full((B, max_len), -100, dtype=torch.long)
+            msk_buf = torch.zeros((B, max_len), dtype=torch.long)
+            t_buf   = torch.zeros(B, dtype=torch.float32)
+            for i, b in enumerate(batch):
                 n = b["input_ids"].shape[0]
-                p = max_len - n
-                ids_out.append(F.pad(b["input_ids"], (0, p), value=pad_id))
-                lbl_out.append(F.pad(b["labels"],    (0, p), value=-100))
-                mask_out.append(F.pad(torch.ones(n, dtype=torch.long), (0, p), value=0))
+                ids_buf[i, :n] = b["input_ids"]
+                lbl_buf[i, :n] = b["labels"]
+                msk_buf[i, :n] = 1
+                t_buf[i]       = b["timestep"]
             return {
-                "input_ids":      torch.stack(ids_out),
-                "labels":         torch.stack(lbl_out),
-                "attention_mask": torch.stack(mask_out),
-                "timestep":       torch.stack([b["timestep"] for b in batch]),
+                "input_ids":      ids_buf,
+                "labels":         lbl_buf,
+                "attention_mask": msk_buf,
+                "timestep":       t_buf,
             }
         return _collate

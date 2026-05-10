@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -143,11 +144,13 @@ class BitDiffLMTrainer:
         return {"val_nll": avg, "val_ppl": math.exp(min(avg, 20))}
 
     def save_checkpoint(self, path: str | Path):
+        tmp_path = str(path) + ".tmp"
         torch.save({
             "global_step": self.global_step,
             "optimizer":   self.optimizer.state_dict(),
             "scheduler":   self.scheduler.state_dict(),
-        }, path)
+        }, tmp_path)
+        os.replace(tmp_path, path)
 
     def load_checkpoint(self, path: str | Path):
         ckpt = torch.load(path, map_location="cpu")
