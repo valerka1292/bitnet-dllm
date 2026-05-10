@@ -61,7 +61,9 @@ class BitLinear(nn.Linear):
     def forward_quantized(self, x_q: torch.Tensor, eta: torch.Tensor, Q_b: int) -> torch.Tensor:
         W_q, gamma = STEQuantizeWeight.apply(self.weight)
         scale = eta * gamma / Q_b
-        out = F.linear(x_q, W_q, self.bias) * scale
+        out = F.linear(x_q, W_q, None) * scale
+        if self.bias is not None:
+            out = out + self.bias
         return out * self.learnable_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

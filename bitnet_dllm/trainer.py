@@ -1,7 +1,6 @@
 from __future__ import annotations
 import math
 import os
-from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -67,7 +66,9 @@ class BitDiffLMTrainer:
             for b in raw.blocks:
                 b.gradient_checkpointing = True
 
-        self.ema_model = deepcopy(self.accelerator.unwrap_model(self.model)).eval()
+        raw = self.accelerator.unwrap_model(self.model)
+        self.ema_model = BitDiffLM(raw.config).to(device=raw.device).eval()
+        self.ema_model.load_state_dict(raw.state_dict())
         for p in self.ema_model.parameters():
             p.requires_grad_(False)
 
@@ -167,6 +168,7 @@ class BitDiffLMTrainer:
                     ckpt_dir = save_dir / f"step_{self.global_step}"
                     raw = self.accelerator.unwrap_model(self.model)
                     raw.save_pretrained(ckpt_dir)
+                    self.ema_model.save_pretrained(ckpt_dir / "ema")
                     self.save_checkpoint(ckpt_dir / "trainer.pt")
 
                 if not self.accelerator.sync_gradients:

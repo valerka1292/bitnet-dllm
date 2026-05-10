@@ -8,7 +8,7 @@ from .trainer   import BitDiffLMTrainer
 from .tracker   import Tracker, ConsoleTracker
 from .utils     import print_model_info, count_parameters
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 __all__ = [
     "BitDiffLMConfig", "list_presets", "register_preset",
     "BitDiffLM",

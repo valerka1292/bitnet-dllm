@@ -63,7 +63,7 @@ def count_parameters(model) -> dict:
     bit = sum(p.numel() for p in bit_params)
     fp = sum(p.numel() for p in (all_params - bit_params))
     total_params = bit + fp
-    inference_mb = (bit * 1 + fp * 2) / 1e6
+    inference_mb = (bit * 0.25 + fp * 2) / 1e6
     training_mb = total_params * 16 / 1e6
 
     return {

@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import Callable
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -33,9 +32,9 @@ class MDLMAncestralSampler:
         t_seq = torch.linspace(1.0, 0.0, num_steps + 1, device=self.device)
 
         for i in range(num_steps):
-            t_cur  = t_seq[i].item()
-            t_next = t_seq[i + 1].item()
-            t_b    = torch.full((B,), t_cur, device=self.device)
+            t_cur  = t_seq[i]
+            t_next = t_seq[i + 1]
+            t_b    = t_cur.expand(B)
             logits = model(x_t, attn, t_b)["logits"] / max(temperature, 1e-8)
 
             if top_p < 1.0:
@@ -49,7 +48,7 @@ class MDLMAncestralSampler:
             else:
                 alpha_t      = 1.0 - t_cur
                 alpha_t_next = 1.0 - t_next
-                unmask_prob  = float(np.clip((alpha_t_next - alpha_t) / max(1.0 - alpha_t, 1e-8), 0.0, 1.0))
+                unmask_prob  = ((alpha_t_next - alpha_t) / (1.0 - alpha_t).clamp(min=1e-8)).clamp(0.0, 1.0)
                 should_unmask = (torch.rand(B, L, device=self.device) < unmask_prob) & is_masked
                 flat  = probs.view(B * L, V).clamp(min=1e-10)
                 flat  = flat / flat.sum(-1, keepdim=True)

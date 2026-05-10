@@ -18,6 +18,10 @@ class MaskedDiffusionDataset(Dataset):
         t_min:          float = 0.05,
         t_max:          float = 0.99,
     ):
+        if mask_token_id < 0 or mask_token_id == pad_token_id:
+            raise ValueError(f"mask_token_id={mask_token_id} must be >= 0 and != pad_token_id={pad_token_id}")
+        if not (0.0 < t_min < t_max <= 1.0):
+            raise ValueError(f"need 0 < t_min={t_min} < t_max={t_max} <= 1.0")
         self.hf_dataset      = hf_dataset
         self.mask_token_id   = mask_token_id
         self.pad_token_id    = pad_token_id
