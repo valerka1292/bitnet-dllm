@@ -32,7 +32,6 @@ class TimestepEmbedding(nn.Module):
 class BitDiffLM(nn.Module):
     def __init__(self, config: BitDiffLMConfig):
         super().__init__()
-        config.validate()
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
